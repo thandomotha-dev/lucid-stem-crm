@@ -1,0 +1,381 @@
+// Lucid Stem CRM: milestone 1 schema.
+// Every business table carries organizationId so multi-user / multi-tenant needs no retrofit.
+// Automation tables (campaigns, sequences, messages, send claims) arrive with milestone 2.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DATABASE_URL_UNPOOLED")
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  AWAITING_RESPONSE
+  REPLIED
+  MEETING_SCHEDULED
+  ON_HOLD
+  NOT_INTERESTED
+  CLIENT
+}
+
+enum EmailHealth {
+  UNKNOWN
+  VALID
+  BOUNCED
+}
+
+// Outreach eligibility. Imports never change this; only an explicit user action or an unsubscribe event does.
+enum MarketingStatus {
+  ELIGIBLE
+  UNSUBSCRIBED
+  DO_NOT_CONTACT
+}
+
+// Why we may contact this person. Needs professional (POPIA) review before outreach goes live.
+enum ContactBasis {
+  UNKNOWN
+  CONSENT
+  LEGITIMATE_INTEREST
+  EXISTING_CUSTOMER
+}
+
+enum ImportStatus {
+  UPLOADED
+  MAPPED
+  VALIDATED
+  IMPORTING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum ImportRowStatus {
+  PENDING
+  VALID
+  INVALID
+  DUPLICATE
+  IMPORTED
+  UPDATED
+  SKIPPED
+  FAILED
+}
+
+enum DuplicateStrategy {
+  SKIP
+  UPDATE
+  REVIEW
+}
+
+enum EmailProviderType {
+  ZOHO_MAIL
+  MOCK
+}
+
+enum EmailAccountStatus {
+  ACTIVE
+  NEEDS_REAUTH
+  DISABLED
+}
+
+model Organization {
+  id                String   @id @default(cuid())
+  name              String
+  slug              String   @unique
+  defaultTimezone   String   @default("Africa/Johannesburg")
+  createdAt         DateTime @default(now())
+
+  // Global emergency switch. Checked immediately before every automated send (milestone 2).
+  automationPaused       Boolean   @default(false)
+  automationPausedAt     DateTime?
+  automationPausedById   String?
+  automationPausedReason String?
+
+  invitations     Invitation[]      
+
+  memberships       Membership[]
+  leads             Lead[]
+  tags              Tag[]
+  customFields      CustomFieldDefinition[]
+  imports           Import[]
+  emailAccounts     EmailAccount[]
+  activities        LeadActivity[]
+  events            DomainEvent[]
+  auditLogs         AuditLog[]
+}
+
+model User {
+  id               String    @id @default(cuid())
+  email            String    @unique // stored normalised (lowercase)
+  name             String
+  passwordHash     String
+  isActive         Boolean   @default(true)
+  failedLoginCount Int       @default(0)
+  lockedUntil      DateTime?
+  lastLoginAt      DateTime?
+  createdAt        DateTime  @default(now())
+
+   invitationsSent Invitation[]      // inside model User
+
+  memberships Membership[]
+  sessions    Session[]
+  ownedLeads  Lead[]       @relation("LeadOwner")
+  imports     Import[]
+}
+
+model Membership {
+  id             String       @id @default(cuid())
+  userId         String
+  organizationId String
+  role           Role
+  createdAt      DateTime     @default(now())
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+}
+
+model Session {
+  id                   String   @id @default(cuid())
+  userId               String
+  activeOrganizationId String
+  tokenHash            String   @unique // SHA-256 of the cookie token; the raw token is never stored
+  expiresAt            DateTime
+  createdAt            DateTime @default(now())
+  userAgent            String?
+  ip                   String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Lead {
+  id              String          @id @default(cuid())
+  organizationId  String
+  email           String
+  emailNormalized String          // lowercase; unique per organisation (archived leads keep their row)
+  firstName       String?
+  lastName        String?
+  company         String?
+  jobTitle        String?
+  phone           String?
+  website         String?
+  industry        String?
+  country         String?
+  timezone        String?         // IANA; falls back to organisation default when null
+  status          LeadStatus      @default(NEW)
+  emailHealth     EmailHealth     @default(UNKNOWN)
+  marketingStatus MarketingStatus @default(ELIGIBLE)
+  contactBasis    ContactBasis    @default(UNKNOWN)
+  customFields    Json            @default("{}")
+  ownerId         String?
+  source          String?         // original import source label, or "manual"
+  importId        String?
+  importedAt      DateTime?
+  archivedAt      DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  owner        User?        @relation("LeadOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  import       Import?      @relation(fields: [importId], references: [id], onDelete: SetNull)
+  tags         LeadTag[]
+  activities   LeadActivity[]
+  importRows   ImportRow[]
+
+  @@unique([organizationId, emailNormalized])
+  @@index([organizationId, status])
+  @@index([organizationId, createdAt])
+  @@index([importId])
+}
+
+model Tag {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  leads        LeadTag[]
+
+  @@unique([organizationId, name])
+}
+
+model LeadTag {
+  leadId    String
+  tagId     String
+  createdAt DateTime @default(now())
+
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  tag  Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([leadId, tagId])
+  @@index([tagId])
+}
+
+model CustomFieldDefinition {
+  id             String   @id @default(cuid())
+  organizationId String
+  key            String   // snake_case, matches CUSTOM_KEY_PATTERN
+  label          String
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, key])
+}
+
+// A CSV import. The file is parsed once and staged in ImportRow, so no object storage is needed.
+model Import {
+  id                String            @id @default(cuid())
+  organizationId    String
+  createdById       String
+  filename          String
+  fileSha256        String
+  sourceLabel       String            // recorded on every lead created by this import
+  status            ImportStatus      @default(UPLOADED)
+  headers           Json              // string[]
+  columnMapping     Json?             // ColumnMapping
+  duplicateStrategy DuplicateStrategy @default(SKIP)
+  defaultTags       Json              @default("[]") // string[]
+    summary           Json?
+  totalRows         Int               @default(0)
+  importedCount     Int               @default(0)
+  updatedCount      Int               @default(0)
+  skippedCount      Int               @default(0)
+  failedCount       Int               @default(0)
+  createdAt         DateTime          @default(now())
+  completedAt       DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy    User         @relation(fields: [createdById], references: [id])
+  rows         ImportRow[]
+  leads        Lead[]
+
+  @@index([organizationId, createdAt])
+}
+
+model ImportRow {
+  id                String          @id @default(cuid())
+  importId          String
+  rowNumber         Int             // 1-based line in the file, header = 1
+  raw               Json            // string[] exactly as uploaded
+  mapped            Json?           // validated fields + custom
+  status            ImportRowStatus @default(PENDING)
+  issues            Json            @default("[]") // errors and warnings
+  duplicateKind     String?         // NONE | IN_FILE | EXISTING
+ 
+  duplicateLeadId   String?
+  leadId            String?
+
+  import Import @relation(fields: [importId], references: [id], onDelete: Cascade)
+  lead   Lead?  @relation(fields: [leadId], references: [id], onDelete: SetNull)
+
+  @@unique([importId, rowNumber])
+  @@index([importId, status])
+}
+
+// Provider-agnostic mailbox. Several per organisation are allowed from day one.
+model EmailAccount {
+  id                   String             @id @default(cuid())
+  organizationId       String
+  provider             EmailProviderType
+  displayName          String
+  emailAddress         String
+  status               EmailAccountStatus @default(ACTIVE)
+  providerConfig       Json               @default("{}") // e.g. Zoho data-centre domains, taken from the OAuth response
+  encryptedCredentials String?            // AES-256-GCM via lib/crypto/secretbox
+  // Null = not configured = automated sending blocked. Set after Zoho limits are verified.
+  dailySendLimit       Int?
+  hourlySendLimit      Int?
+  sendingPaused        Boolean            @default(false) // per-account pause, in addition to the org-wide switch
+  createdAt            DateTime           @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, emailAddress])
+}
+
+// Lead timeline: what the prospect's CRM profile shows (acceptance test step 11).
+model LeadActivity {
+  id             String   @id @default(cuid())
+  organizationId String
+  leadId         String
+  type           String   // e.g. lead.created, lead.status_changed, note.added; email.* arrives in milestone 2+
+  actorId        String?  // null = system/automation
+  data           Json     @default("{}")
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  lead         Lead         @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@index([leadId, createdAt])
+}
+
+// Outbox: written in the same transaction as the change that caused it; the automation engine consumes it.
+model DomainEvent {
+  id             String    @id @default(cuid())
+  organizationId String
+  type           String    // lead.created, lead.status_changed, lead.imported ...
+  entityType     String
+  entityId       String
+  payload        Json      @default("{}")
+  createdAt      DateTime  @default(now())
+  processedAt    DateTime?
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([processedAt, createdAt])
+  @@index([organizationId, type])
+}
+
+// Security/admin audit trail (who did what). Distinct from the automation activity log (milestone 2).
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String?  // null for pre-auth events such as failed logins
+  actorId        String?
+  action         String
+  entityType     String?
+  entityId       String?
+  metadata       Json     @default("{}")
+  ip             String?
+  createdAt      DateTime @default(now())
+
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@index([actorId])
+}
+
+model Invitation {
+  id             String    @id @default(cuid())
+  organizationId String
+  email          String    // stored normalised
+  role           Role
+  tokenHash      String    @unique // SHA-256 of the link token; the raw token is never stored
+  createdById    String
+  expiresAt      DateTime
+  usedAt         DateTime?
+  revokedAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdBy    User         @relation(fields: [createdById], references: [id])
+
+  @@index([organizationId, createdAt])
+}

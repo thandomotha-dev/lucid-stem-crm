@@ -1,0 +1,13 @@
+node_modules
+.next
+.env
+.env.local
+*.tsbuildinfo
+.neon
+
+# secrets
+.env
+.env.*
+!.env.example
+*.bak
+*.broken
